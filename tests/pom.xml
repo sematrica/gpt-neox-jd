@@ -215,3 +215,212 @@ public class MethodUsageAspect {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package org.csa.facets.infra;
+
+import org.aspectj.lang.JoinPoint;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+
+import java.io.*;
+import java.net.InetAddress;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+
+// MongoDB driver (project already uses it in your other code)
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import org.bson.Document;
+
+/**
+ * Method usage logger that works for BOTH local tests (e.g., ManagerTest)
+ * and the packaged JAR (Manager) with ZERO runtime flags or config changes.
+ *
+ * - Catch-all pointcut for your compiled classes (getters/setters skipped).
+ * - Records count + last N invocations (timestamp + args).
+ * - Prints a summary once at JVM shutdown.
+ * - Writes ONE MongoDB document per run (summary + calls).
+ */
+@Aspect
+public class MethodUsageAspect {
+
+    // ===== Config (override with -D if desired; defaults match your project) =====
+    private static final int MAX_LINES_PER_METHOD = Integer.getInteger("usage.maxLinesPerMethod", 200);
+
+    private static final boolean MONGO_ENABLED =
+            Boolean.parseBoolean(System.getProperty("usage.mongo.enabled", "true"));
+    private static final String MONGO_CONFIG_FILE =
+            System.getProperty("usage.mongo.configFile", "cfm.config"); // where "mongodburi" lives
+    private static final String MONGO_URI_PROP_KEY =
+            System.getProperty("usage.mongo.uriProperty", "mongodburi");
+    private static final String MONGO_DB =
+            System.getProperty("usage.mongo.db", "CNSTeamPlayground");
+    private static final String MONGO_COLLECTION =
+            System.getProperty("usage.mongo.collection", "cs_Automation_APILog_Facets");
+
+    // ===== State =====
+    private static final Instant STARTED_AT = Instant.now();
+
+    // Per-method counts and ring-buffered call lines
+    private static final ConcurrentHashMap<String, LongAdder> COUNTS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, RingBuffer> CALLS = new ConcurrentHashMap<>();
+
+    // ISO-8601 timestamp in system zone
+    private static final DateTimeFormatter TS_FMT =
+            DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneId.systemDefault());
+
+    static {
+        // Print + persist once at JVM shutdown
+        Runtime.getRuntime().addShutdownHook(new Thread(MethodUsageAspect::onShutdown, "method-usage-summary"));
+    }
+
+    // Catch-all for your compiled classes; skip getters/setters and this aspect itself.
+    @Before("execution(* *(..))"
+          + " && !execution(* *.get*(..))"
+          + " && !execution(* *.set*(..))"
+          + " && !within(org.csa.facets.infra.MethodUsageAspect)")
+    public void onEnter(JoinPoint jp) {
+        String typeName = jp.getSignature().getDeclaringTypeName();
+        String methodKey = typeName + "#" + jp.getSignature().getName();
+
+        // Count
+        COUNTS.computeIfAbsent(methodKey, k -> new LongAdder()).increment();
+
+        // Store one compact line: [timestamp] Class#method(args...)
+        String ts = TS_FMT.format(Instant.now());
+        String args = Arrays.toString(jp.getArgs());
+        CALLS.computeIfAbsent(methodKey, k -> new RingBuffer(MAX_LINES_PER_METHOD))
+             .add("[" + ts + "] " + methodKey + "(" + args + ")");
+    }
+
+    // ===== Shutdown handling =====
+    private static void onShutdown() {
+        printSummary();
+        if (MONGO_ENABLED) {
+            try {
+                flushToMongoSingleDoc();
+            } catch (Exception e) {
+                System.err.println("MethodUsageAspect: Failed to write single doc to MongoDB: " + e.getMessage());
+            }
+        }
+    }
+
+    // Console summary
+    private static void printSummary() {
+        System.out.println("===== Method Usage Summary =====");
+        List<Map.Entry<String, LongAdder>> sorted = new ArrayList<>(COUNTS.entrySet());
+        sorted.sort((a, b) -> Long.compare(b.getValue().sum(), a.getValue().sum()));
+        for (Map.Entry<String, LongAdder> e : sorted) {
+            String method = e.getKey();
+            long count = e.getValue().sum();
+            System.out.printf("%8d  %s%n", count, method);
+            RingBuffer rb = CALLS.get(method);
+            if (rb != null) rb.forEach(line -> System.out.println("          " + line));
+        }
+        System.out.println("================================");
+    }
+
+    // ===== MongoDB: write ONE document per run =====
+    private static void flushToMongoSingleDoc() throws Exception {
+        Properties props = loadProps(MONGO_CONFIG_FILE);
+        String uri = props.getProperty(MONGO_URI_PROP_KEY);
+        if (uri == null || uri.trim().isEmpty()) {
+            throw new IllegalStateException("Property '" + MONGO_URI_PROP_KEY + "' not found in " + MONGO_CONFIG_FILE);
+        }
+
+        String username = System.getProperty("user.name", "unknown");
+        String machine;
+        try { machine = InetAddress.getLocalHost().getHostName(); }
+        catch (Exception e) { machine = "unknown"; }
+
+        // Build per-method docs (sorted by count desc)
+        long totalCalls = COUNTS.values().stream().mapToLong(LongAdder::sum).sum();
+        List<Document> methodDocs = new ArrayList<>();
+
+        List<Map.Entry<String, LongAdder>> sorted = new ArrayList<>(COUNTS.entrySet());
+        sorted.sort((a, b) -> Long.compare(b.getValue().sum(), a.getValue().sum()));
+
+        for (Map.Entry<String, LongAdder> e : sorted) {
+            String method = e.getKey();
+            long count = e.getValue().sum();
+
+            Document mdoc = new Document("method", method)
+                    .append("count", count);
+
+            RingBuffer rb = CALLS.get(method);
+            if (rb != null) {
+                List<String> lines = new ArrayList<>();
+                rb.forEach(lines::add); // array of "[ts] Class#method(args...)" strings
+                mdoc.append("calls", lines);
+            } else {
+                mdoc.append("calls", Collections.emptyList());
+            }
+            methodDocs.add(mdoc);
+        }
+
+        Document runDoc = new Document("type", "method-usage")
+                .append("version", 1)
+                .append("username", username)
+                .append("machineName", machine)
+                .append("startedAt", TS_FMT.format(STARTED_AT))
+                .append("finishedAt", TS_FMT.format(Instant.now()))
+                .append("config", new Document("maxLinesPerMethod", MAX_LINES_PER_METHOD))
+                .append("totals", new Document("methods", COUNTS.size())
+                        .append("calls", totalCalls))
+                .append("methods", methodDocs);
+
+        try (MongoClient client = MongoClients.create(uri)) {
+            MongoDatabase db = client.getDatabase(MONGO_DB);
+            MongoCollection<Document> col = db.getCollection(MONGO_COLLECTION);
+            col.insertOne(runDoc); // <-- exactly one document per run
+        }
+    }
+
+    // Load props from classpath ("/cfm.config") or file ("cfm.config")
+    private static Properties loadProps(String fileName) throws IOException {
+        Properties p = new Properties();
+        InputStream in = MethodUsageAspect.class.getResourceAsStream("/" + fileName);
+        if (in != null) { try (BufferedInputStream bis = new BufferedInputStream(in)) { p.load(bis); } return p; }
+        try (FileInputStream fis = new FileInputStream(fileName)) { p.load(fis); }
+        return p;
+    }
+
+    // ===== Small synchronized ring buffer =====
+    private static final class RingBuffer {
+        private final String[] buf;
+        private int i = 0, n = 0;
+        RingBuffer(int capacity) { this.buf = new String[Math.max(1, capacity)]; }
+        synchronized void add(String s) { buf[i] = s; i = (i + 1) % buf.length; if (n < buf.length) n++; }
+        synchronized void forEach(java.util.function.Consumer<String> c) {
+            int start = (i - n + buf.length) % buf.length;
+            for (int k = 0; k < n; k++) c.accept(buf[(start + k) % buf.length]);
+        }
+    }
+}
+
+
