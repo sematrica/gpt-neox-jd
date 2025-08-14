@@ -30,30 +30,31 @@
       </configuration>
     </plugin>
 
-    <!-- AspectJ compile-time weaving -->
     <plugin>
-      <groupId>org.codehaus.mojo</groupId>
-      <artifactId>aspectj-maven-plugin</artifactId>
-      <version>1.15.0</version>
-      <configuration>
-        <complianceLevel>${maven.compiler.release}</complianceLevel>
-        <encoding>${project.build.sourceEncoding}</encoding>
-        <showWeaveInfo>true</showWeaveInfo>
-        <verbose>true</verbose>
-        <sources>
-          <sourceRoot>${project.build.sourceDirectory}</sourceRoot>
-        </sources>
-        <weaveMainSourceFolder>true</weaveMainSourceFolder>
-      </configuration>
-      <executions>
-        <execution>
-          <goals>
-            <goal>compile</goal>
-            <goal>test-compile</goal>
-          </goals>
-        </execution>
-      </executions>
-    </plugin>
+  <groupId>org.codehaus.mojo</groupId>
+  <artifactId>aspectj-maven-plugin</artifactId>
+  <version>1.15.0</version>
+  <configuration>
+    <complianceLevel>${maven.compiler.release}</complianceLevel>
+    <encoding>${project.build.sourceEncoding}</encoding>
+    <showWeaveInfo>true</showWeaveInfo>
+    <verbose>true</verbose>
+
+    <!-- Tell ajc where your .java files live -->
+    <sourceRoot>${project.build.sourceDirectory}</sourceRoot>
+
+    <!-- Weave your main sources so self-invocations are caught -->
+    <weaveMainSourceFolder>true</weaveMainSourceFolder>
+  </configuration>
+  <executions>
+    <execution>
+      <goals>
+        <goal>compile</goal>
+        <goal>test-compile</goal>
+      </goals>
+    </execution>
+  </executions>
+</plugin>
 
   </plugins>
 </build>
