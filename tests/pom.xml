@@ -31,7 +31,9 @@
   </executions>
 </plugin>
 
-
+mvn -q -DskipTests package
+java -javaagent:"$HOME/.m2/repository/org/aspectj/aspectjweaver/1.9.22.1/aspectjweaver-1.9.22.1.jar" \
+     -cp target/csafacetsmanager-*.jar ManagerTest
 
 <dependency>
   <groupId>org.aspectj</groupId>
