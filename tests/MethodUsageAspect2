@@ -14,55 +14,44 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * One aspect that works for both production and tests.
+ * Method usage logger that works for BOTH local tests (e.g., ManagerTest)
+ * and the packaged JAR (Manager) with ZERO runtime flags or config changes.
  *
- * VM properties (all optional):
- *   -Dusage.enabled=true|false        (default: true)
- *   -Dusage.scope=app|catchall        (default: app)
- *   -Dusage.basePackage=org.csa.facets (default: org.csa.facets)
- *   -Dusage.maxLinesPerMethod=200     (default: 200)
+ * - Catch-all pointcut for your compiled classes (getters/setters skipped).
+ * - Records count + last N invocations (timestamp + args).
+ * - Prints a summary once at JVM shutdown.
  *
- * "app" logs only classes whose FQN starts with basePackage.
- * "catchall" logs all compiled classes (except getters/setters and this aspect).
- * Prints a summary at JVM shutdown.
+ * Because we use compile-time weaving, this affects ONLY classes compiled in
+ * this module (not JDK / third-party deps).
  */
 @Aspect
 public class MethodUsageAspect {
 
-    // ----- Config (read once at class load) -----
-    private static final boolean ENABLED =
-            Boolean.parseBoolean(System.getProperty("usage.enabled", "true"));
-    private static final String SCOPE =
-            System.getProperty("usage.scope", "app").trim().toLowerCase(); // app | catchall
-    private static final String BASE_PKG =
-            System.getProperty("usage.basePackage", "org.csa.facets");
-    private static final int MAX_LINES_PER_METHOD =
-            Math.max(1, Integer.parseInt(System.getProperty("usage.maxLinesPerMethod", "200")));
+    // Keep memory bounded: how many lines per method to remember
+    private static final int MAX_LINES_PER_METHOD = 200;
 
-    // ----- State -----
+    // Per-method counts
     private static final ConcurrentHashMap<String, LongAdder> COUNTS = new ConcurrentHashMap<>();
+    // Per-method ring buffer of recent call lines
     private static final ConcurrentHashMap<String, RingBuffer> CALLS = new ConcurrentHashMap<>();
+
     private static final DateTimeFormatter TS_FMT =
             DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneId.systemDefault());
 
     static {
+        // Print once at JVM shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(MethodUsageAspect::printSummary, "method-usage-summary"));
     }
 
-    // Catch-all pointcut; we filter inside the advice to allow runtime toggling.
+    // Catch-all for your compiled classes; skip getters/setters and this aspect itself.
     @Before("execution(* *(..))"
           + " && !execution(* *.get*(..))"
           + " && !execution(* *.set*(..))"
           + " && !within(org.csa.facets.infra.MethodUsageAspect)")
     public void onEnter(JoinPoint jp) {
-        if (!ENABLED) return;
-
         String typeName = jp.getSignature().getDeclaringTypeName();
-        if ("app".equals(SCOPE) && (typeName == null || !typeName.startsWith(BASE_PKG))) {
-            return; // only log your app package in "app" scope
-        }
-
         String methodKey = typeName + "#" + jp.getSignature().getName();
+
         COUNTS.computeIfAbsent(methodKey, k -> new LongAdder()).increment();
 
         String ts = TS_FMT.format(Instant.now());
@@ -72,8 +61,7 @@ public class MethodUsageAspect {
     }
 
     private static void printSummary() {
-        if (!ENABLED) return;
-        System.out.println("===== Method Usage Summary (" + SCOPE + "; base=" + BASE_PKG + ") =====");
+        System.out.println("===== Method Usage Summary =====");
         List<Map.Entry<String, LongAdder>> sorted = COUNTS.entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue().sum(), a.getValue().sum()))
                 .toList();
@@ -84,14 +72,14 @@ public class MethodUsageAspect {
             RingBuffer rb = CALLS.get(method);
             if (rb != null) rb.forEach(line -> System.out.println("          " + line));
         }
-        System.out.println("=================================================");
+        System.out.println("================================");
     }
 
     /** Tiny synchronized ring buffer to cap memory. */
     private static final class RingBuffer {
         private final String[] buf;
         private int i = 0, n = 0;
-        RingBuffer(int capacity) { this.buf = new String[capacity]; }
+        RingBuffer(int capacity) { this.buf = new String[Math.max(1, capacity)]; }
         synchronized void add(String s) { buf[i] = s; i = (i + 1) % buf.length; if (n < buf.length) n++; }
         synchronized void forEach(java.util.function.Consumer<String> c) {
             int start = (i - n + buf.length) % buf.length;
